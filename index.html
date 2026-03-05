@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Electron + isolated-vm</title>
+  </head>
+  <body>
+    <h1>Prueba de isolated-vm en Electron</h1>
+    <button id="run">Ejecutar isolated-vm</button>
+    <div id="result"></div>
+    <script>
+      const { ipcRenderer } = require('electron');
+      document.getElementById('run').onclick = async () => {
+        const result = await ipcRenderer.invoke('run-ivm');
+        document.getElementById('result').innerText = 'Resultado: ' + result;
+      };
+    </script>
+  </body>
+</html>

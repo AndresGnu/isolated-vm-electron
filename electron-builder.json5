@@ -1,0 +1,111 @@
+/**
+ * @see https://www.electron.build/configuration/configuration
+ */
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "com.wasivospro.app",
+  "productName": "wasivospro",
+  "asar": true,
+  "directories": {
+    "output": "release/wasivospro/${version}"
+  },
+  "files": [
+    "dist",
+    "main.js",
+    "index.html",
+    "package.json",
+    // Copia SOLO las dependencias de producción (electron-builder hace esto auto, pero si falla lo forzamos)
+    // El truco es NO poner "node_modules/**/*", sino dejar que el builder lo resuelva,
+    // y solo forzar las carpetas conflictivas:
+     {
+      "from": "node_modules/.prisma",
+      "to": "node_modules/.prisma",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "node_modules/libsignal",
+      "to": "node_modules/libsignal",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "node_modules/@whiskeysockets/libsignal-node",
+      "to": "node_modules/@whiskeysockets/libsignal-node",
+      "filter": ["**/*"]
+    }
+  ],
+  "asarUnpack": [
+    "node_modules/@electric-sql/**",
+    "**/node_modules/libsignal",
+    "**/node_modules/@whiskeysockets/libsignal-node",
+    "**/node_modules/baileys",
+    // 2. DESCOMPRIMIR Prisma para que el binario funcione
+    "**/node_modules/.prisma/**/*",
+    "**/node_modules/@prisma/engines/**/*",
+    "node_modules/sharp/**",
+    "node_modules/@img/**"
+  ],
+
+  "mac": {
+    "icon": "app/icons/icon.icns",
+    "artifactName": "${productName}_${version}.${ext}",
+    "publish": {
+      "provider": "s3",
+      "bucket": "git-trials",
+      "region": "us-west-2",
+      "path": "wasivospro"
+    },
+    "target": [
+      "default"
+    ]
+  },
+  "linux": {
+    "icon": "app/icons/icon.icns",
+    "artifactName": "${productName}_${version}.${ext}",
+    "publish": {
+      "provider": "s3",
+      "bucket": "git-trials",
+      "region": "us-west-2",
+      "path": "wasivospro"
+    },
+    "category": "Utility",
+    "asar": true,
+    "target": [
+      {
+        "target": "AppImage",
+        "arch": [
+          "x64"
+        ]
+      }
+    ]
+  },
+  "rpm": {
+    "packageName": "wasivos1",
+    "synopsis": "wasivos1 app"
+  },
+  "win": {
+    "icon": "app/icons/icon.ico",
+    "publish": {
+      "provider": "s3",
+      "bucket": "git-trials",
+      "region": "us-west-2",
+      "path": "wasivos1"
+    },
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "artifactName": "${productName}_${version}.${ext}"
+  },
+  "nsis": {
+    "oneClick": true,
+    "perMachine": false,
+    "installerIcon": "app/icons/icon.ico",
+    "uninstallerIcon": "app/icons/icon.ico",
+    "allowToChangeInstallationDirectory": false,
+    "deleteAppDataOnUninstall": true
+  }
+}

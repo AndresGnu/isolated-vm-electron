@@ -1,0 +1,42 @@
+name: Build Electron App
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10.10.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Rebuild native dependencies (isolated-vm)
+        run: pnpm exec electron-builder install-app-deps
+
+      - name: Upload isolated-vm native binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated_vm-${{ matrix.os }}.node
+          path: node_modules/isolated-vm/out/isolated_vm.node

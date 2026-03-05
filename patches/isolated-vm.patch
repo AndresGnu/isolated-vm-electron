@@ -1,0 +1,277 @@
+diff --git a/binding.gyp b/binding.gyp
+index b98bd035a6c471d1f07e1e3da68f77c5a5da140c..481162408c534a9cacf36b7d6ced441944efc470 100644
+--- a/binding.gyp
++++ b/binding.gyp
+@@ -78,6 +78,7 @@
+ 				'src/isolate/executor.cc',
+ 				'src/isolate/holder.cc',
+ 				'src/isolate/inspector.cc',
++				'src/isolate/node_allocator_wrapper.cc',
+ 				'src/isolate/platform_delegate.cc',
+ 				'src/isolate/scheduler.cc',
+ 				'src/isolate/stack_trace.cc',
+diff --git a/src/external_copy/string.cc b/src/external_copy/string.cc
+index 4acb2d0d4860a6af54f37a5475b8bc8eb9fd4801..e844faf672281a8aceccd1e18906e0fb31a5c2a0 100644
+--- a/src/external_copy/string.cc
++++ b/src/external_copy/string.cc
+@@ -79,16 +79,16 @@ ExternalCopyString::ExternalCopyString(Local<String> string) :
+ 	if (string->IsOneByte()) {
+ 		one_byte = true;
+ 		value = std::make_shared<std::vector<char>>(string->Length());
+-		string->WriteOneByte(
++		string->WriteOneByteV2(
+ 			Isolate::GetCurrent(),
+-			reinterpret_cast<uint8_t*>(value->data()), 0, -1, String::WriteOptions::NO_NULL_TERMINATION
++			0, string->Length(), reinterpret_cast<uint8_t*>(value->data()), String::WriteFlags::kNone
+ 		);
+ 	} else {
+ 		one_byte = false;
+ 		value = std::make_shared<std::vector<char>>(string->Length() << 1);
+-		string->Write(
++		string->WriteV2(
+ 			Isolate::GetCurrent(),
+-			reinterpret_cast<uint16_t*>(value->data()), 0, -1, String::WriteOptions::NO_NULL_TERMINATION
++			0, string->Length(), reinterpret_cast<uint16_t*>(value->data()), String::WriteFlags::kNone
+ 		);
+ 	}
+ }
+diff --git a/src/isolate/allocator.h b/src/isolate/allocator.h
+index 727dac8cead375d117c3aa34ecf2d57b98eaac3d..c593ab8837eef1cccb37e52afcc54ef9cd0da983 100644
+--- a/src/isolate/allocator.h
++++ b/src/isolate/allocator.h
+@@ -16,15 +16,21 @@ class LimitedAllocator : public v8::ArrayBuffer::Allocator {
+ 	public:
+ 		auto Check(size_t length) -> bool;
+ 		explicit LimitedAllocator(class IsolateEnvironment& env, size_t limit);
++		~LimitedAllocator() override = default;
+ 		auto Allocate(size_t length) -> void* final;
+ 		auto AllocateUninitialized(size_t length) -> void* final;
+ 		void Free(void* data, size_t length) final;
++#if V8_AT_LEAST(10, 4, 164)
++		v8::PageAllocator* GetPageAllocator() override;
++#endif
+ 
+ 		// This is used by ExternalCopy when an ArrayBuffer is transferred. The memory is not freed but
+ 		// we should no longer count it against the isolate
+ 		void AdjustAllocatedSize(ptrdiff_t length);
+ 		auto GetFailureCount() const -> int;
+ 		void Track(v8::Local<v8::Object> handle, size_t size);
++	private:
++		std::unique_ptr<v8::ArrayBuffer::Allocator> delegate;
+ };
+ 
+ } // namespace ivm
+diff --git a/src/isolate/allocator_nortti.cc b/src/isolate/allocator_nortti.cc
+index daaed1020946237d4d7e3a53e06eea3eda27787d..0dfd200f924b8f37a05b40cf9686bd2a97c336fb 100644
+--- a/src/isolate/allocator_nortti.cc
++++ b/src/isolate/allocator_nortti.cc
+@@ -1,10 +1,12 @@
+ #include "allocator.h"
+ #include "environment.h"
+ #include <cstdlib>
++#include "v8_version.h"
+ 
+ using namespace v8;
+ 
+ namespace ivm {
++v8::ArrayBuffer::Allocator* CreateNodeArrayBufferAllocator();
+ namespace {
+ 
+ class ExternalMemoryHandle {
+@@ -68,26 +70,29 @@ auto LimitedAllocator::Check(const size_t length) -> bool {
+ 	return v8_heap + env.extra_allocated_memory + length <= limit + env.misc_memory_size;
+ }
+ 
+-LimitedAllocator::LimitedAllocator(IsolateEnvironment& env, size_t limit) : env(env), limit(limit), v8_heap(1024 * 1024 * 4), next_check(1024 * 1024) {}
++LimitedAllocator::LimitedAllocator(IsolateEnvironment& env, size_t limit) : env(env), limit(limit), v8_heap(1024 * 1024 * 4), next_check(1024 * 1024) {
++#if V8_AT_LEAST(10, 4, 164)
++	auto delegate_ptr = CreateNodeArrayBufferAllocator();
++	delegate = std::unique_ptr<v8::ArrayBuffer::Allocator>{delegate_ptr};
++#else
++	delegate = std::unique_ptr<v8::ArrayBuffer::Allocator>{v8::ArrayBuffer::Allocator::NewDefaultAllocator()};
++#endif
++#if !V8_AT_LEAST(9, 3, 0)
++	env.GetIsolate()->AddGCPrologueCallback(LimitedAllocator::GCPrologueCallback);
++#endif
++}
+ 
+ auto LimitedAllocator::Allocate(size_t length) -> void* {
+ 	if (Check(length)) {
+ 		env.extra_allocated_memory += length;
+-		return std::calloc(length, 1);
++		return delegate->Allocate(length);
+ 	} else {
+ 		++failures;
+ 		if (length <= 64) { // kMinAddedElementsCapacity * sizeof(uint32_t)
+-			// When a tiny TypedArray is created v8 will avoid calling the allocator and instead just use
+-			// the internal heap. This is all fine until someone wants a pointer to the underlying buffer,
+-			// in that case v8 will "materialize" an ArrayBuffer which does invoke this allocator. If the
+-			// allocator refuses to return a valid pointer it will result in a hard crash so we have no
+-			// choice but to let this allocation succeed. Luckily the amount of memory allocated is tiny
+-			// and will soon be freed because at the same time we terminate the isolate.
+ 			env.extra_allocated_memory += length;
+ 			env.Terminate();
+-			return std::calloc(length, 1);
++			return delegate->Allocate(length);
+ 		} else {
+-			// The places end up here are more graceful and will throw a RangeError
+ 			return nullptr;
+ 		}
+ 	}
+@@ -96,13 +101,13 @@ auto LimitedAllocator::Allocate(size_t length) -> void* {
+ auto LimitedAllocator::AllocateUninitialized(size_t length) -> void* {
+ 	if (Check(length)) {
+ 		env.extra_allocated_memory += length;
+-		return std::malloc(length);
++		return delegate->AllocateUninitialized(length);
+ 	} else {
+ 		++failures;
+ 		if (length <= 64) {
+ 			env.extra_allocated_memory += length;
+ 			env.Terminate();
+-			return std::malloc(length);
++			return delegate->AllocateUninitialized(length);
+ 		} else {
+ 			return nullptr;
+ 		}
+@@ -112,8 +117,14 @@ auto LimitedAllocator::AllocateUninitialized(size_t length) -> void* {
+ void LimitedAllocator::Free(void* data, size_t length) {
+ 	env.extra_allocated_memory -= length;
+ 	next_check -= length;
+-	std::free(data);
++	delegate->Free(data, length);
++}
++
++#if V8_AT_LEAST(10, 4, 164)
++v8::PageAllocator* LimitedAllocator::GetPageAllocator() {
++	return delegate->GetPageAllocator();
+ }
++#endif
+ 
+ void LimitedAllocator::AdjustAllocatedSize(ptrdiff_t length) {
+ 	env.extra_allocated_memory += length;
+diff --git a/src/isolate/class_handle.h b/src/isolate/class_handle.h
+index ab05293cf163b6d22251e40c5854dfbd1cf279b2..43a94b71dc3be36706e236290e2176ba1fbefc2b 100644
+--- a/src/isolate/class_handle.h
++++ b/src/isolate/class_handle.h
+@@ -228,9 +228,9 @@ class ClassHandle {
+ 		 */
+ 		template <class Type>
+ 		static auto MaybeFreeze(v8::Local<v8::Object> handle) {
+-			auto context = handle->GetIsolate()->GetCurrentContext();
++			auto context = v8::Isolate::GetCurrent()->GetCurrentContext();
+ 			if (!detail::DontFreezePrototype<Type>::value) {
+-				handle->GetPrototype().As<v8::Object>()->SetIntegrityLevel(context, v8::IntegrityLevel::kFrozen);
++				handle->GetPrototypeV2().As<v8::Object>()->SetIntegrityLevel(context, v8::IntegrityLevel::kFrozen);
+ 			}
+ 			if (!detail::DontFreezeInstance<Type>::value) {
+ 				handle->SetIntegrityLevel(context, v8::IntegrityLevel::kFrozen);
+diff --git a/src/isolate/environment.cc b/src/isolate/environment.cc
+index d4ad5208798985e3cc77b62dc611c77e8ac03040..2bb17aa564dfa6d871c783359bfa74f24cbe900e 100644
+--- a/src/isolate/environment.cc
++++ b/src/isolate/environment.cc
+@@ -371,7 +371,6 @@ void IsolateEnvironment::IsolateCtor(size_t memory_limit_in_mb, shared_ptr<v8::B
+ 
+ 	// Build isolate from create params
+ 	Isolate::CreateParams create_params;
+-	create_params.constraints = rc;
+ 	create_params.array_buffer_allocator_shared = allocator_ptr;
+ 	if (snapshot_blob_ptr) {
+ 		create_params.snapshot_blob = &startup_data;
+@@ -381,7 +380,11 @@ void IsolateEnvironment::IsolateCtor(size_t memory_limit_in_mb, shared_ptr<v8::B
+ 	task_runner = std::make_shared<IsolateTaskRunner>(holder.lock()->GetIsolate());
+ 	{
+ 		std::lock_guard allocator_lock{isolate_allocator_mutex};
++#if V8_AT_LEAST(10, 4, 164)
++		isolate = Isolate::Allocate(IsolateGroup::GetDefault());
++#else
+ 		isolate = Isolate::Allocate();
++#endif
+ 		PlatformDelegate::RegisterIsolate(isolate, &*scheduler);
+ 	}
+ 	Isolate::Initialize(isolate, create_params);
+@@ -405,8 +408,10 @@ void IsolateEnvironment::IsolateCtor(size_t memory_limit_in_mb, shared_ptr<v8::B
+ 	// Create a default context for the library to use if needed
+ 	{
+ 		Locker locker(isolate);
++		Isolate::Scope isolate_scope(isolate);
+ 		HandleScope handle_scope(isolate);
+-		default_context.Reset(isolate, NewContext());
++		Local<Context> ctx = NewContext();
++		default_context.Reset(isolate, ctx);
+ 	}
+ 
+ 	// There is no asynchronous Isolate ctor so we should throw away thread specifics in case
+@@ -478,8 +483,7 @@ static void DeserializeInternalFieldsCallback(Local<Object> /*holder*/, int /*in
+ }
+ 
+ auto IsolateEnvironment::NewContext() -> Local<Context> {
+-	auto context =
+-	Context::New(isolate, nullptr, {}, {}, &DeserializeInternalFieldsCallback);
++	auto context = Context::New(isolate, nullptr, {}, {}, &DeserializeInternalFieldsCallback);
+ 	context->AllowCodeGenerationFromStrings(false);
+ 	// TODO (but I'm not going to do it): This causes a DCHECK failure in debug builds. Tested nodejs
+ 	// v14.17.3 & v16.5.1.
+diff --git a/src/isolate/node_allocator_wrapper.cc b/src/isolate/node_allocator_wrapper.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d29871e31e47bb520b60d0b9747136d07445645
+--- /dev/null
++++ b/src/isolate/node_allocator_wrapper.cc
+@@ -0,0 +1,9 @@
++#include <node.h>
++
++namespace ivm {
++
++v8::ArrayBuffer::Allocator* CreateNodeArrayBufferAllocator() {
++	return node::ArrayBufferAllocator::Create().release();
++}
++
++} // namespace ivm
+diff --git a/src/module/isolate.cc b/src/module/isolate.cc
+index 548dcbccc56eaf822b7ee673172b9d93dd93aadc..1e4d54959bb25a22ebbf45e1458e5d0f13a0b7d9 100644
+--- a/src/module/isolate.cc
++++ b/src/module/isolate.cc
+@@ -74,7 +74,7 @@ class LibraryHandle : public TransferableHandle {
+ 
+ 			// Also freeze this prototype
+ 			library->SetIntegrityLevel(context, IntegrityLevel::kFrozen);
+-			library->GetPrototype().As<Object>()->SetIntegrityLevel(context, IntegrityLevel::kFrozen);
++			library->GetPrototypeV2().As<Object>()->SetIntegrityLevel(context, IntegrityLevel::kFrozen);
+ 			return library;
+ 		}
+ };
+diff --git a/src/module/module_handle.cc b/src/module/module_handle.cc
+index 531569a49784b2188af1963b09ca2d8b91d8c237..a0482a54dec03fa6cb22460228477f0812b2e4a5 100644
+--- a/src/module/module_handle.cc
++++ b/src/module/module_handle.cc
+@@ -109,7 +109,7 @@ void ModuleHandle::InitializeImportMeta(Local<Context> context, Local<Module> mo
+ 			detail::RunBarrier([&]() {
+ 				Local<Value> argv[1];
+ 				argv[0] = meta;
+-				Unmaybe(found->meta_callback.Deref()->Call(context, Undefined(context->GetIsolate()), 1, argv));
++				Unmaybe(found->meta_callback.Deref()->Call(context, Undefined(Isolate::GetCurrent()), 1, argv));
+ 			});
+ 		}
+ 	}
+diff --git a/src/module/reference_handle.cc b/src/module/reference_handle.cc
+index c3cf9ade79b2772bb8e07978fe8b583e1df76a7f..f234e659ff72bfe0cef85d62c0c617072894e61a 100644
+--- a/src/module/reference_handle.cc
++++ b/src/module/reference_handle.cc
+@@ -482,7 +482,7 @@ class AccessorRunner : public ThreePhaseTask {
+ 			if (object->IsProxy()) {
+ 				return true;
+ 			} else {
+-				auto proto = object->GetPrototype();
++				auto proto = object->GetPrototypeV2();
+ 				if (proto->IsNullOrUndefined()) {
+ 					return false;
+ 				} else {
+@@ -528,7 +528,7 @@ class GetRunner final : public AccessorRunner {
+ 								}
+ 								return Unmaybe(target->GetRealNamedProperty(context, name));
+ 							}
+-							auto next = target->GetPrototype();
++							auto next = target->GetPrototypeV2();
+ 							if (next->IsNullOrUndefined()) {
+ 								return Undefined(isolate).As<Value>();
+ 							}
