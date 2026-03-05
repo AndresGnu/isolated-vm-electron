@@ -8,7 +8,7 @@
 		"build": "electron-builder"
 	},
 	"dependencies": {
-		"isolated-vm": "^6.0.2"
+		"isolated-vm": "file:./isolated-vm-polyfill"
 	},
 	"devDependencies": {
 		"electron": "40.2.1",
